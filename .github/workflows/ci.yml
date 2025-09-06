@@ -1,0 +1,58 @@
+
+name: ci
+on:
+  push: { branches: [ main ] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: catering
+        ports: [ "5432:5432" ]
+        options: >-
+          --health-cmd="pg_isready -U app -d catering"
+          --health-interval=5s --health-timeout=5s --health-retries=12
+
+    env:
+      ConnectionStrings__Default: Host=localhost;Port=5432;Database=catering;Username=app;Password=app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Wait for DB & apply schema
+        run: |
+          sudo apt-get update && sudo apt-get install -y postgresql-client
+          for i in {1..30}; do
+            (PGPASSWORD=app pg_isready -h localhost -p 5432 -U app -d catering) && break
+            sleep 1
+          done
+          PGPASSWORD=app psql -h localhost -U app -d catering -f db/schema.sql
+          if [ -f db/02-reservations.sql ]; then PGPASSWORD=app psql -h localhost -U app -d catering -f db/02-reservations.sql; fi
+          if [ -f ops/dev-seed.sh ]; then chmod +x ops/dev-seed.sh && ./ops/dev-seed.sh; fi
+
+      - name: Restore & Build
+        run: |
+          dotnet restore ./src/Backend/Backend.csproj
+          dotnet build   ./src/Backend/Backend.csproj --configuration Release --no-restore
+
+      - name: Run tests
+        run: |
+          dotnet test ./tests/Backend.Tests/Backend.Tests.csproj --logger "trx;LogFileName=test.trx"
+
+      - name: Build & push image to GHCR (main only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker build -t ghcr.io/${{ github.repository }}/backend:sha-${{ github.sha }} ./src/Backend
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ghcr.io/${{ github.repository }}/backend:sha-${{ github.sha }}
